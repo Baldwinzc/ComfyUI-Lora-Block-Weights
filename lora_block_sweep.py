@@ -22,18 +22,28 @@ _RE_DOUBLE = re.compile(r"diffusion_model\.double_blocks\.(\d+)\.")
 _RE_SINGLE = re.compile(r"diffusion_model\.single_blocks\.(\d+)\.")
 
 
-def _classify_key(key: str) -> str:
+def _classify_key(key) -> str:
     """Return block tag for a state_dict key.
 
     Returns one of: 'D00'..'D18', 'S00'..'S37', or 'extras'.
-    'extras' covers img_in / txt_in / time_in / vector_in / guidance_in / final_layer.
+    'extras' covers img_in / txt_in / time_in / vector_in / guidance_in /
+    final_layer.
+
+    comfy.lora.load_lora returns a dict whose keys may be either a plain
+    string state_dict key or a tuple (key_name, offset, function), so we
+    normalize to the string form first (mirrors comfy/model_patcher.py
+    add_patches handling).
     """
-    m = _RE_DOUBLE.search(key)
+    if isinstance(key, str):
+        key_str = key
+    else:
+        key_str = key[0]
+    m = _RE_DOUBLE.search(key_str)
     if m:
         idx = int(m.group(1))
         if 0 <= idx < DOUBLE_BLOCK_COUNT:
             return f"D{idx:02d}"
-    m = _RE_SINGLE.search(key)
+    m = _RE_SINGLE.search(key_str)
     if m:
         idx = int(m.group(1))
         if 0 <= idx < SINGLE_BLOCK_COUNT:
