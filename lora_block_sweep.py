@@ -1,9 +1,13 @@
 import re
 from collections import defaultdict
 
+import torch
+
 import folder_paths
 import comfy.lora
 import comfy.lora_convert
+import comfy.sample
+import comfy.samplers
 import comfy.utils
 
 
@@ -212,12 +216,161 @@ class LoraBlockSweepFluxCustom:
         return (new_model, new_clip, info)
 
 
+def _load_lora_for_sweep(model, clip, lora_name):
+    """Load a LoRA file and resolve its keys against the model + clip state dicts.
+    Returns (loaded_patches, lora_sd) ready for blockwise patching.
+    """
+    lora_path = folder_paths.get_full_path("loras", lora_name)
+    lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
+    lora_sd = comfy.lora_convert.convert_lora(lora_sd)
+
+    key_map = {}
+    key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
+    if clip is not None:
+        key_map = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, key_map)
+    loaded = comfy.lora.load_lora(lora_sd, key_map)
+    return loaded
+
+
+def _sample_one(model, seed, steps, cfg, sampler_name, scheduler,
+                positive, negative, latent, denoise):
+    """Run one sampling pass. Mirrors nodes.py:common_ksampler but skips the
+    UI preview callback (we have our own progress bar across the sweep).
+    """
+    latent_image = latent["samples"]
+    latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
+    batch_inds = latent.get("batch_index")
+    noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+    noise_mask = latent.get("noise_mask")
+
+    samples = comfy.sample.sample(
+        model, noise, steps, cfg, sampler_name, scheduler,
+        positive, negative, latent_image,
+        denoise=denoise, noise_mask=noise_mask,
+        disable_pbar=True, seed=seed,
+    )
+    out = latent.copy()
+    out["samples"] = samples
+    return out
+
+
+class LoraBlockSweepFluxBatch:
+    """All-in-one sweep: for every (block, value) combination, patch the model
+    in place, sample, decode, and collect into a batched IMAGE output.
+
+    Replaces both the LoRA loader and the KSampler. Wire VAE in directly so
+    decoding happens inside the sweep loop; downstream you only need a
+    SaveImage / Image Comparer.
+
+    Note: CLIP-side LoRA modifications cannot take effect here because the
+    positive/negative CONDITIONING is already encoded upstream. If you need
+    the LoRA's text-encoder contribution, encode prompts AFTER a regular
+    LoRA loader instead.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        default_blocks = ",".join(ALL_TARGET_BLOCKS)
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "vae": ("VAE",),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "seed": ("INT", {"default": 0, "min": 0,
+                                 "max": 0xffffffffffffffff}),
+                "steps": ("INT", {"default": 25, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0,
+                                  "step": 0.1, "round": 0.01}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,
+                                 {"default": "euler"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,
+                              {"default": "simple"}),
+                "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
+                                      "step": 0.01}),
+                "block_list": ("STRING",
+                               {"default": default_blocks, "multiline": True,
+                                "tooltip": "Comma-separated block tags. "
+                                           "Defaults to all 57 (D00..D18,S00..S37). "
+                                           "Trim to D00..D18 for a faster first round."}),
+                "value_list": ("STRING",
+                               {"default": "0,0.25,0.5,0.75,1.0",
+                                "tooltip": "Comma-separated strength values."}),
+                "baseline_weight": ("FLOAT",
+                                    {"default": 1.0, "min": 0.0, "max": 2.0,
+                                     "step": 0.05,
+                                     "tooltip": "Knock-out: 1.0. Solo: 0.0."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "info")
+    FUNCTION = "sweep"
+    CATEGORY = "LoraBlockSweep"
+
+    def sweep(self, model, vae, lora_name, positive, negative, latent_image,
+              seed, steps, cfg, sampler_name, scheduler, denoise,
+              block_list, value_list, baseline_weight):
+        blocks = [b.strip().upper() for b in block_list.split(",") if b.strip()]
+        try:
+            values = [float(v.strip()) for v in value_list.split(",") if v.strip()]
+        except ValueError as e:
+            raise ValueError(f"value_list must be comma-separated numbers, got error: {e}")
+
+        if not blocks:
+            raise ValueError("block_list is empty")
+        if not values:
+            raise ValueError("value_list is empty")
+
+        unknown = [b for b in blocks if b not in ALL_TARGET_BLOCKS]
+        if unknown:
+            raise ValueError(f"Unknown block tags: {unknown}. "
+                             f"Valid: D00..D18, S00..S37")
+
+        loaded = _load_lora_for_sweep(model, None, lora_name)
+        total = len(blocks) * len(values)
+        pbar = comfy.utils.ProgressBar(total)
+        all_images = []
+        log = []
+
+        for block in blocks:
+            for value in values:
+                strengths = _build_block_strengths(block, value, baseline_weight)
+                new_model = model.clone()
+                _apply_blockwise_patches(new_model, loaded, strengths)
+
+                latent_out = _sample_one(
+                    new_model, seed, steps, cfg, sampler_name, scheduler,
+                    positive, negative, latent_image, denoise,
+                )
+                image = vae.decode(latent_out["samples"])
+                if image.ndim == 5:
+                    image = image.reshape(-1, image.shape[-3],
+                                          image.shape[-2], image.shape[-1])
+                all_images.append(image)
+                log.append(f"{block}={value:.3f}")
+                pbar.update(1)
+
+                # Drop the patched clone explicitly to free patcher state
+                del new_model
+
+        images_batch = torch.cat(all_images, dim=0)
+        info = (f"sweep done: {total} images, "
+                f"{len(blocks)} blocks x {len(values)} values, "
+                f"baseline={baseline_weight:.3f}")
+        return (images_batch, info)
+
+
 NODE_CLASS_MAPPINGS = {
     "LoraBlockSweepFlux": LoraBlockSweepFlux,
     "LoraBlockSweepFluxCustom": LoraBlockSweepFluxCustom,
+    "LoraBlockSweepFluxBatch": LoraBlockSweepFluxBatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoraBlockSweepFlux": "LoRA Block Sweep (FLUX)",
     "LoraBlockSweepFluxCustom": "LoRA Block Sweep Custom (FLUX)",
+    "LoraBlockSweepFluxBatch": "LoRA Block Sweep Batch (FLUX)",
 }

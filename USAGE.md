@@ -76,6 +76,45 @@ Example: keep all double blocks, drop late single blocks:
 
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0,0,0,0,0,0
 
+## Node 3: LoRA Block Sweep Batch (FLUX) — all-in-one
+
+Self-contained sweep that does NOT need Efficiency Nodes XY Plot. Internally
+loops over (block, value) combinations, samples for each, and returns a
+batched IMAGE output.
+
+Replaces both the LoRA loader AND the KSampler. Wire VAE in directly.
+
+### Wiring
+
+```
+UNETLoader 73 ─→ model
+VAE         75 ─→ vae
+                  lora_name = xdt_i2i/xdt_char_i2i_v1_copy.safetensors
+CLIPTextEncode 86 ─→ positive  (encode prompts as usual)
+ConditioningZeroOut 82 ─→ negative
+EmptySD3LatentImage / VAEEncode 79 ─→ latent_image
+                  seed/steps/cfg/sampler/scheduler/denoise: same as KSampler
+                  block_list  = D00,D01,...,D18,S00,...,S37  (or trim)
+                  value_list  = 0,0.25,0.5,0.75,1.0
+                  baseline_weight = 1.0  (Knock-out) or 0.0 (Solo)
+                  
+images output → SaveImage   (saves all N images, batched)
+```
+
+The CLIP input is intentionally absent — CLIP-side LoRA changes have no
+effect because positive/negative are already encoded upstream. If you need
+CLIP-side LoRA, use the regular Block Sweep node + external XY plot
+instead.
+
+### First-round recipe
+
+For a faster first pass, edit `block_list` to only the 19 double blocks:
+
+    D00,D01,D02,D03,D04,D05,D06,D07,D08,D09,D10,D11,D12,D13,D14,D15,D16,D17,D18
+
+That's 19 x 5 = 95 images. After reviewing, expand to the 38 single blocks
+in a second run if needed.
+
 ## Tips
 
 - Set seed to fixed in KSampler so the only variable in the grid is block weight
