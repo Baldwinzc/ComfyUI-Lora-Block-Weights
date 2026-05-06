@@ -1,7 +1,10 @@
+import os
 import re
 from collections import defaultdict
 
+import numpy as np
 import torch
+from PIL import Image, ImageDraw, ImageFont
 
 import folder_paths
 import comfy.lora
@@ -373,14 +376,152 @@ class LoraBlockSweepFluxBatch:
         return (images_batch, info)
 
 
+def _load_font(size: int):
+    """Pick the first available system font, fall back to PIL default."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+def _tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
+    """ComfyUI IMAGE tensor (H,W,C) float [0,1] -> PIL RGB."""
+    arr = (255.0 * image_tensor.cpu().numpy()).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+class LoraBlockSweepSaveGrid:
+    """Compose a sweep IMAGE batch into a single labeled grid PNG.
+
+    Cells stay at original resolution (no resizing) so cloth / surface
+    texture stays inspectable at 100%. Labels live in dedicated header
+    columns / rows, never overlaid on the image, so nothing is occluded.
+
+    The IMAGE batch is interpreted as row-major: the outer loop is the
+    block_list, inner loop is the value_list (matches the Batch sweep
+    node's iteration order).
+    """
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        default_blocks = ",".join(ALL_TARGET_BLOCKS[:DOUBLE_BLOCK_COUNT])
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "blocks": ("STRING",
+                           {"default": default_blocks, "multiline": True,
+                            "tooltip": "Block tags in row order, must match "
+                                       "the order used in the sweep."}),
+                "values": ("STRING",
+                           {"default": "0,0.5,1.0",
+                            "tooltip": "Values in column order, must match "
+                                       "the order used in the sweep."}),
+                "filename_prefix": ("STRING", {"default": "lbw_grid"}),
+                "label_size": ("INT", {"default": 36, "min": 8, "max": 256}),
+                "pad": ("INT", {"default": 16, "min": 0, "max": 256}),
+                "compress_level": ("INT", {"default": 4, "min": 0, "max": 9,
+                                           "tooltip": "PNG deflate level. "
+                                                      "PNG is always lossless; "
+                                                      "0 = no compression (fastest, "
+                                                      "biggest file), 9 = max."}),
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_grid"
+    OUTPUT_NODE = True
+    CATEGORY = "LoraBlockSweep"
+
+    def save_grid(self, images, blocks, values, filename_prefix,
+                  label_size, pad, compress_level,
+                  prompt=None, extra_pnginfo=None):
+        block_list = [b.strip() for b in blocks.split(",") if b.strip()]
+        value_list = [v.strip() for v in values.split(",") if v.strip()]
+        rows = len(block_list)
+        cols = len(value_list)
+        expected = rows * cols
+
+        if images.shape[0] != expected:
+            raise ValueError(
+                f"images batch size {images.shape[0]} does not match "
+                f"{rows} blocks x {cols} values = {expected}"
+            )
+
+        cells = [_tensor_to_pil(images[i]) for i in range(expected)]
+        cell_w = max(c.width for c in cells)
+        cell_h = max(c.height for c in cells)
+
+        font = _load_font(label_size)
+        # Measure labels to size the header columns/rows precisely.
+        dummy = Image.new("RGB", (10, 10))
+        dctx = ImageDraw.Draw(dummy)
+
+        def text_size(s):
+            bbox = dctx.textbbox((0, 0), s, font=font)
+            return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+        col_label_strings = [f"v={v}" for v in value_list]
+        row_label_strings = list(block_list)
+
+        col_label_h = max(text_size(s)[1] for s in col_label_strings) + 2 * pad
+        row_label_w = max(text_size(s)[0] for s in row_label_strings) + 2 * pad
+
+        grid_w = row_label_w + cols * cell_w + (cols + 1) * pad
+        grid_h = col_label_h + rows * cell_h + (rows + 1) * pad
+
+        grid = Image.new("RGB", (grid_w, grid_h), "white")
+        draw = ImageDraw.Draw(grid)
+
+        for col_idx, txt in enumerate(col_label_strings):
+            x0 = row_label_w + pad + col_idx * (cell_w + pad)
+            tw, th = text_size(txt)
+            draw.text((x0 + (cell_w - tw) // 2, (col_label_h - th) // 2),
+                      txt, fill="black", font=font)
+
+        for row_idx, txt in enumerate(row_label_strings):
+            y0 = col_label_h + pad + row_idx * (cell_h + pad)
+            tw, th = text_size(txt)
+            draw.text(((row_label_w - tw) // 2, y0 + (cell_h - th) // 2),
+                      txt, fill="black", font=font)
+
+            for col_idx in range(cols):
+                cell = cells[row_idx * cols + col_idx]
+                x = row_label_w + pad + col_idx * (cell_w + pad)
+                grid.paste(cell, (x, y0))
+
+        full_output_folder, filename, counter, subfolder, _ = \
+            folder_paths.get_save_image_path(
+                filename_prefix, self.output_dir, grid_w, grid_h)
+
+        out_name = f"{filename}_{counter:05}_.png"
+        out_path = os.path.join(full_output_folder, out_name)
+        grid.save(out_path, compress_level=compress_level)
+
+        return {"ui": {"images": [{"filename": out_name,
+                                    "subfolder": subfolder,
+                                    "type": "output"}]}}
+
+
 NODE_CLASS_MAPPINGS = {
     "LoraBlockSweepFlux": LoraBlockSweepFlux,
     "LoraBlockSweepFluxCustom": LoraBlockSweepFluxCustom,
     "LoraBlockSweepFluxBatch": LoraBlockSweepFluxBatch,
+    "LoraBlockSweepSaveGrid": LoraBlockSweepSaveGrid,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoraBlockSweepFlux": "LoRA Block Sweep (FLUX)",
     "LoraBlockSweepFluxCustom": "LoRA Block Sweep Custom (FLUX)",
     "LoraBlockSweepFluxBatch": "LoRA Block Sweep Batch (FLUX)",
+    "LoraBlockSweepSaveGrid": "LoRA Block Sweep Save Grid",
 }
