@@ -318,8 +318,8 @@ class LoraBlockSweepFluxBatch:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("images", "info")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("images", "info", "blocks_used", "values_used")
     FUNCTION = "sweep"
     CATEGORY = "LoraBlockSweep"
 
@@ -373,7 +373,9 @@ class LoraBlockSweepFluxBatch:
         info = (f"sweep done: {total} images, "
                 f"{len(blocks)} blocks x {len(values)} values, "
                 f"baseline={baseline_weight:.3f}")
-        return (images_batch, info)
+        blocks_used = ",".join(blocks)
+        values_used = ",".join(f"{v:g}" for v in values)
+        return (images_batch, info, blocks_used, values_used)
 
 
 def _load_font(size: int):
