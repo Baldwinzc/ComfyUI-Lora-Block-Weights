@@ -54,6 +54,59 @@ def _classify_key(key) -> str:
     return "extras"
 
 
+_RE_TAG = re.compile(r"^([DS])(\d{1,3})$")
+
+
+def _parse_group(spec: str) -> list:
+    """Parse a group spec like 'D00-D06,S15-S20,D10' into a list of block tags.
+
+    - Range: 'D00-D06' expands to ['D00','D01',...,'D06']
+    - Single: 'S15' stays 'S15'
+    - Mixed within a comma list: 'D00-D03,S20' = ['D00','D01','D02','D03','S20']
+
+    Ranges may not cross D and S (e.g. 'D18-S00' is rejected).
+    """
+    tags = []
+    for raw in spec.split(","):
+        part = raw.strip().upper()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            ma, mb = _RE_TAG.match(a), _RE_TAG.match(b)
+            if not (ma and mb):
+                raise ValueError(f"Bad range '{part}' in group spec")
+            if ma.group(1) != mb.group(1):
+                raise ValueError(
+                    f"Range '{part}' mixes D and S blocks (split into two)")
+            prefix = ma.group(1)
+            start = int(ma.group(2))
+            end = int(mb.group(2))
+            if start > end:
+                start, end = end, start
+            for i in range(start, end + 1):
+                tags.append(f"{prefix}{i:02d}")
+        else:
+            if not _RE_TAG.match(part):
+                raise ValueError(f"Bad block tag '{part}' in group spec")
+            tags.append(part)
+    unknown = [t for t in tags if t not in ALL_TARGET_BLOCKS]
+    if unknown:
+        raise ValueError(f"Out-of-range tags in group spec: {unknown}")
+    return tags
+
+
+def _build_group_strengths(group_tags: list, group_value: float,
+                           baseline_weight: float) -> dict:
+    """Like _build_block_strengths but for a list of tags forming one group."""
+    strengths = {tag: baseline_weight for tag in ALL_TARGET_BLOCKS}
+    strengths["extras"] = baseline_weight
+    for tag in group_tags:
+        if tag in strengths:
+            strengths[tag] = group_value
+    return strengths
+
+
 def _build_block_strengths(target_block: str, target_value: float,
                            baseline_weight: float) -> dict:
     """Build {block_tag: strength} map.
@@ -397,6 +450,137 @@ class LoraBlockSweepFluxBatch:
         return (images_batch, info, blocks_used, values_used)
 
 
+DEFAULT_GROUPS = (
+    "D00-D06\n"
+    "D07-D12\n"
+    "D13-D18\n"
+    "S00-S12\n"
+    "S13-S25\n"
+    "S26-S37\n"
+    "D00-D18\n"
+    "S00-S37"
+)
+
+
+class LoraBlockSweepFluxGroup:
+    """Group sweep for Flux LoRA: each iteration knocks out (or solos) a
+    *range* of blocks instead of one. For LoRAs whose effect is spread
+    too thinly across many blocks for single-block sweeps to surface
+    anything visible.
+
+    groups: one group per line, e.g.
+
+        D00-D06
+        D07-D12
+        S26-S37
+        D00-D18,S00-S05      (commas combine ranges into one group)
+
+    For each group the chosen blocks are set to value (looped over
+    value_list); every other block is set to baseline_weight.
+
+      baseline_weight=1.0 + value=0   -> knock-out the group
+      baseline_weight=0.0 + value=1   -> solo the group
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "vae": ("VAE",),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "seed": ("INT", {"default": 0, "min": 0,
+                                 "max": 0xffffffffffffffff}),
+                "steps": ("INT", {"default": 25, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0,
+                                  "step": 0.1, "round": 0.01}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,
+                                 {"default": "euler"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,
+                              {"default": "simple"}),
+                "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
+                                      "step": 0.01}),
+                "groups": ("STRING",
+                           {"default": DEFAULT_GROUPS, "multiline": True,
+                            "tooltip": "One group per line. Use D00-D06 for "
+                                       "a range, comma to combine ranges."}),
+                "value_list": ("STRING",
+                               {"default": "0",
+                                "tooltip": "Values applied to each group. "
+                                           "Default '0' = single knock-out "
+                                           "test. Use '0,1' to also see "
+                                           "the group fully active for "
+                                           "comparison."}),
+                "baseline_weight": ("FLOAT",
+                                    {"default": 1.0, "min": 0.0, "max": 2.0,
+                                     "step": 0.05,
+                                     "tooltip": "Knock-out: 1.0. Solo: 0.0."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("images", "info", "groups_used", "values_used")
+    FUNCTION = "sweep"
+    CATEGORY = "LoraBlockSweep"
+
+    def sweep(self, model, vae, lora_name, positive, negative, latent_image,
+              seed, steps, cfg, sampler_name, scheduler, denoise,
+              groups, value_list, baseline_weight):
+        group_lines = [g.strip() for g in groups.splitlines() if g.strip()]
+        if not group_lines:
+            raise ValueError("groups is empty")
+        try:
+            values = [float(v.strip()) for v in value_list.split(",") if v.strip()]
+        except ValueError as e:
+            raise ValueError(f"value_list parse error: {e}")
+        if not values:
+            raise ValueError("value_list is empty")
+
+        group_tags = [_parse_group(g) for g in group_lines]
+        loaded = _load_lora_for_sweep(model, None, lora_name)
+        total = len(group_lines) * len(values)
+        pbar = comfy.utils.ProgressBar(total)
+        all_images = []
+
+        print(f"[LBW Group] {total} runs: {len(group_lines)} groups x "
+              f"{len(values)} values, baseline={baseline_weight}")
+        for i, (label, tags) in enumerate(zip(group_lines, group_tags)):
+            print(f"[LBW Group]   group {i}: '{label}' -> {len(tags)} blocks")
+
+        first_iter = True
+        for label, tags in zip(group_lines, group_tags):
+            for value in values:
+                strengths = _build_group_strengths(tags, value,
+                                                   baseline_weight)
+                new_model = model.clone()
+                _apply_blockwise_patches(new_model, loaded, strengths,
+                                         debug=first_iter)
+                first_iter = False
+
+                latent_out = _sample_one(
+                    new_model, seed, steps, cfg, sampler_name, scheduler,
+                    positive, negative, latent_image, denoise,
+                )
+                image = vae.decode(latent_out["samples"])
+                if image.ndim == 5:
+                    image = image.reshape(-1, image.shape[-3],
+                                          image.shape[-2], image.shape[-1])
+                all_images.append(image)
+                pbar.update(1)
+                del new_model
+
+        images_batch = torch.cat(all_images, dim=0)
+        info = (f"group sweep done: {total} images, "
+                f"{len(group_lines)} groups x {len(values)} values, "
+                f"baseline={baseline_weight:.3f}")
+        groups_used = ",".join(group_lines)
+        values_used = ",".join(f"{v:g}" for v in values)
+        return (images_batch, info, groups_used, values_used)
+
+
 def _load_font(size: int):
     """Pick the first available system font, fall back to PIL default."""
     candidates = [
@@ -537,6 +721,7 @@ NODE_CLASS_MAPPINGS = {
     "LoraBlockSweepFlux": LoraBlockSweepFlux,
     "LoraBlockSweepFluxCustom": LoraBlockSweepFluxCustom,
     "LoraBlockSweepFluxBatch": LoraBlockSweepFluxBatch,
+    "LoraBlockSweepFluxGroup": LoraBlockSweepFluxGroup,
     "LoraBlockSweepSaveGrid": LoraBlockSweepSaveGrid,
 }
 
@@ -544,5 +729,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoraBlockSweepFlux": "LoRA Block Sweep (FLUX)",
     "LoraBlockSweepFluxCustom": "LoRA Block Sweep Custom (FLUX)",
     "LoraBlockSweepFluxBatch": "LoRA Block Sweep Batch (FLUX)",
+    "LoraBlockSweepFluxGroup": "LoRA Block Sweep Group (FLUX)",
     "LoraBlockSweepSaveGrid": "LoRA Block Sweep Save Grid",
 }
