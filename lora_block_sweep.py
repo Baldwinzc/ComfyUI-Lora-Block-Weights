@@ -70,7 +70,7 @@ def _build_block_strengths(target_block: str, target_value: float,
 
 
 def _apply_blockwise_patches(model_patcher, loaded_patches: dict,
-                             block_strengths: dict):
+                             block_strengths: dict, debug: bool = False):
     """Group loaded patches by block tag, then call add_patches once per group
     with the per-block strength. Empty-strength groups are skipped to avoid
     no-op work.
@@ -79,6 +79,16 @@ def _apply_blockwise_patches(model_patcher, loaded_patches: dict,
     for k, v in loaded_patches.items():
         tag = _classify_key(k)
         by_block[tag][k] = v
+
+    if debug:
+        print("[LBW debug] patches grouped by block tag:")
+        for tag in sorted(by_block.keys()):
+            count = len(by_block[tag])
+            strength = block_strengths.get(tag, 0.0)
+            sample_key = next(iter(by_block[tag]))
+            sample_str = sample_key[0] if not isinstance(sample_key, str) else sample_key
+            print(f"  {tag:>8}: {count:>4} patches, strength={strength:.3f}, "
+                  f"sample={sample_str[:80]}")
 
     applied_keys = set()
     for tag, patches in by_block.items():
@@ -348,11 +358,20 @@ class LoraBlockSweepFluxBatch:
         all_images = []
         log = []
 
+        print(f"[LBW] Loaded {len(loaded)} LoRA patches from {lora_name}")
+        sample_keys = list(loaded.keys())[:3]
+        for sk in sample_keys:
+            sk_str = sk[0] if not isinstance(sk, str) else sk
+            print(f"[LBW]   sample loaded key: {sk_str}")
+
+        first_iter = True
         for block in blocks:
             for value in values:
                 strengths = _build_block_strengths(block, value, baseline_weight)
                 new_model = model.clone()
-                _apply_blockwise_patches(new_model, loaded, strengths)
+                _apply_blockwise_patches(new_model, loaded, strengths,
+                                         debug=first_iter)
+                first_iter = False
 
                 latent_out = _sample_one(
                     new_model, seed, steps, cfg, sampler_name, scheduler,
