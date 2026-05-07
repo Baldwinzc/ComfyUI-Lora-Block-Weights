@@ -462,6 +462,33 @@ DEFAULT_GROUPS = (
 )
 
 
+# Mode presets for the Group sweep: name -> (target_value, baseline_weight)
+GROUP_MODES = {
+    "knockout": (0.0, 1.0),  # group off, others on -> "what does dropping it do"
+    "solo":     (1.0, 0.0),  # group on, others off -> "what does it alone do"
+    "full":     (1.0, 1.0),  # everything on        -> "complete LoRA reference"
+    "off":      (0.0, 0.0),  # everything off       -> "no LoRA reference"
+}
+DEFAULT_MODES = "knockout,solo,full"
+
+
+def _parse_modes(spec: str):
+    """Return [(label, value, baseline), ...] from a comma list of mode names."""
+    out = []
+    for raw in spec.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name not in GROUP_MODES:
+            valid = ",".join(GROUP_MODES.keys())
+            raise ValueError(f"Unknown mode '{name}'. Valid: {valid}")
+        value, baseline = GROUP_MODES[name]
+        out.append((name, value, baseline))
+    if not out:
+        raise ValueError("modes list is empty")
+    return out
+
+
 class LoraBlockSweepFluxGroup:
     """Group sweep for Flux LoRA: each iteration knocks out (or solos) a
     *range* of blocks instead of one. For LoRAs whose effect is spread
@@ -507,54 +534,48 @@ class LoraBlockSweepFluxGroup:
                            {"default": DEFAULT_GROUPS, "multiline": True,
                             "tooltip": "One group per line. Use D00-D06 for "
                                        "a range, comma to combine ranges."}),
-                "value_list": ("STRING",
-                               {"default": "0",
-                                "tooltip": "Values applied to each group. "
-                                           "Default '0' = single knock-out "
-                                           "test. Use '0,1' to also see "
-                                           "the group fully active for "
-                                           "comparison."}),
-                "baseline_weight": ("FLOAT",
-                                    {"default": 1.0, "min": 0.0, "max": 2.0,
-                                     "step": 0.05,
-                                     "tooltip": "Knock-out: 1.0. Solo: 0.0."}),
+                "modes": ("STRING",
+                          {"default": DEFAULT_MODES,
+                           "tooltip": "Comma list of column types. "
+                                      "knockout = group off, others on. "
+                                      "solo = group on, others off. "
+                                      "full = everything on (LoRA reference). "
+                                      "off = everything off (no-LoRA "
+                                      "reference). Each entry becomes one "
+                                      "column in the output grid."}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("images", "info", "groups_used", "values_used")
+    RETURN_NAMES = ("images", "info", "groups_used", "modes_used")
     FUNCTION = "sweep"
     CATEGORY = "LoraBlockSweep"
 
     def sweep(self, model, vae, lora_name, positive, negative, latent_image,
               seed, steps, cfg, sampler_name, scheduler, denoise,
-              groups, value_list, baseline_weight):
+              groups, modes):
         group_lines = [g.strip() for g in groups.splitlines() if g.strip()]
         if not group_lines:
             raise ValueError("groups is empty")
-        try:
-            values = [float(v.strip()) for v in value_list.split(",") if v.strip()]
-        except ValueError as e:
-            raise ValueError(f"value_list parse error: {e}")
-        if not values:
-            raise ValueError("value_list is empty")
+        mode_specs = _parse_modes(modes)
 
         group_tags = [_parse_group(g) for g in group_lines]
         loaded = _load_lora_for_sweep(model, None, lora_name)
-        total = len(group_lines) * len(values)
+        total = len(group_lines) * len(mode_specs)
         pbar = comfy.utils.ProgressBar(total)
         all_images = []
 
+        mode_summary = ", ".join(f"{n}(v={v:g},base={b:g})"
+                                 for n, v, b in mode_specs)
         print(f"[LBW Group] {total} runs: {len(group_lines)} groups x "
-              f"{len(values)} values, baseline={baseline_weight}")
+              f"{len(mode_specs)} modes [{mode_summary}]")
         for i, (label, tags) in enumerate(zip(group_lines, group_tags)):
             print(f"[LBW Group]   group {i}: '{label}' -> {len(tags)} blocks")
 
         first_iter = True
         for label, tags in zip(group_lines, group_tags):
-            for value in values:
-                strengths = _build_group_strengths(tags, value,
-                                                   baseline_weight)
+            for mode_name, value, baseline in mode_specs:
+                strengths = _build_group_strengths(tags, value, baseline)
                 new_model = model.clone()
                 _apply_blockwise_patches(new_model, loaded, strengths,
                                          debug=first_iter)
@@ -574,11 +595,10 @@ class LoraBlockSweepFluxGroup:
 
         images_batch = torch.cat(all_images, dim=0)
         info = (f"group sweep done: {total} images, "
-                f"{len(group_lines)} groups x {len(values)} values, "
-                f"baseline={baseline_weight:.3f}")
+                f"{len(group_lines)} groups x {len(mode_specs)} modes")
         groups_used = ",".join(group_lines)
-        values_used = ",".join(f"{v:g}" for v in values)
-        return (images_batch, info, groups_used, values_used)
+        modes_used = ",".join(n for n, _, _ in mode_specs)
+        return (images_batch, info, groups_used, modes_used)
 
 
 def _load_font(size: int):
@@ -675,7 +695,14 @@ class LoraBlockSweepSaveGrid:
             bbox = dctx.textbbox((0, 0), s, font=font)
             return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-        col_label_strings = [f"v={v}" for v in value_list]
+        def _fmt_col(v):
+            try:
+                float(v)
+                return f"v={v}"
+            except ValueError:
+                return v
+
+        col_label_strings = [_fmt_col(v) for v in value_list]
         row_label_strings = list(block_list)
 
         col_label_h = max(text_size(s)[1] for s in col_label_strings) + 2 * pad
